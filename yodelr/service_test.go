@@ -524,6 +524,97 @@ func TestMassDeleteCompactsAndPreservesSurvivors(t *testing.T) {
 	}
 }
 
+func TestRetiredTopicIsForgottenAndIdReused(t *testing.T) {
+	s := NewService()
+	mustAddUser(t, s, "ada")
+	mustAddUser(t, s, "bob")
+	mustAddPost(t, s, "ada", "#secret plans", 1)
+	mustAddPost(t, s, "bob", "#public stuff", 2)
+	if err := s.DeleteUser("ada"); err != nil {
+		t.Fatalf("DeleteUser: %v", err)
+	}
+
+	// The retired topic is gone from every surface, including the
+	// interning table (the privacy point of deletion)...
+	assertStrings(t, "retired topic", s.GetPostsForTopic("secret"), nil)
+	if _, ok := s.topicIDs["secret"]; ok {
+		t.Fatal("'secret' is still interned after its last post died")
+	}
+	if len(s.freeTopicIDs) != 1 {
+		t.Fatalf("freeTopicIDs = %v, want one retired id", s.freeTopicIDs)
+	}
+	// ...and its id slot is handed to the next new topic instead of
+	// growing the tables.
+	before := len(s.topicNames)
+	mustAddPost(t, s, "bob", "#fresh topic", 3)
+	if len(s.topicNames) != before {
+		t.Fatalf("topicNames grew to %d, want %d (retired id reused)",
+			len(s.topicNames), before)
+	}
+	assertStrings(t, "fresh topic", s.GetPostsForTopic("fresh"),
+		[]string{"#fresh topic"})
+	assertStrings(t, "trending", trendingAll(s),
+		[]string{"fresh", "public"})
+	assertStrings(t, "surviving topic untouched",
+		s.GetPostsForTopic("public"), []string{"#public stuff"})
+}
+
+func TestMentionLogCompactsAfterHeavyDeletion(t *testing.T) {
+	s := NewService()
+	mustAddUser(t, s, "ada")
+	mustAddUser(t, s, "bob")
+	ts := int64(0)
+	for i := 0; i < 100; i++ {
+		ts++
+		mustAddPost(t, s, "ada", "#a #b #c", ts) // 3 mentions each
+		ts++
+		mustAddPost(t, s, "bob", "fine #keep"+itoa(i%5), ts) // 1 mention
+	}
+	if err := s.DeleteUser("ada"); err != nil { // kills 300 of 400 mentions
+		t.Fatalf("DeleteUser: %v", err)
+	}
+	if s.mentionCompactions == 0 {
+		t.Fatal("deleting 3/4 of all mentions never compacted the log")
+	}
+	if got := len(s.mentionFlat); got != 100 {
+		t.Fatalf("mention log holds %d entries, want the 100 live ones",
+			got)
+	}
+	// Trending still answers correctly from the compacted log.
+	assertStrings(t, "trending", trendingAll(s),
+		[]string{"keep0", "keep1", "keep2", "keep3", "keep4"})
+	// And the service keeps working past the compaction.
+	mustAddPost(t, s, "bob", "#keep0 again", ts+1)
+	assertStrings(t, "trending after new post", trendingAll(s),
+		[]string{"keep0", "keep1", "keep2", "keep3", "keep4"})
+}
+
+func TestPostingListsAreRightSizedAfterDeletion(t *testing.T) {
+	s := NewService()
+	mustAddUser(t, s, "heavy")
+	mustAddUser(t, s, "light")
+	ts := int64(0)
+	for i := 0; i < 1000; i++ {
+		ts++
+		mustAddPost(t, s, "heavy", "#hot post", ts)
+	}
+	ts++
+	mustAddPost(t, s, "light", "#hot too", ts)
+	if err := s.DeleteUser("heavy"); err != nil {
+		t.Fatalf("DeleteUser: %v", err)
+	}
+	id, ok := s.topicIDs["hot"]
+	if !ok {
+		t.Fatal("'hot' still has a live post and must stay interned")
+	}
+	if c, l := cap(s.topicPosts[id]), len(s.topicPosts[id]); c > 2*l {
+		t.Fatalf("posting list keeps cap %d for len %d after deletion",
+			c, l)
+	}
+	assertStrings(t, "survivor", s.GetPostsForTopic("hot"),
+		[]string{"#hot too"})
+}
+
 func itoa(n int) string {
 	if n == 0 {
 		return "0"

@@ -70,8 +70,12 @@ const deadLoc = math.MaxUint64
 //   - timestamps — int64, strictly increasing.
 //   - mentionFlat / mentionOff — per-post topic ids packed in CSR
 //     form: post p's topic ids live in
-//     mentionFlat[mentionOff[p]:mentionOff[p+1]].
-//   - topicIDs / topicNames — topic string interning.
+//     mentionFlat[mentionOff[p]:mentionOff[p+1]]. Deleting tombstones
+//     entries in place; once tombstones outnumber live mentions, one
+//     compaction pass rebuilds the log (amortized O(1) per delete).
+//   - topicIDs / topicNames — topic string interning. A topic whose
+//     last live post is deleted is retired: its name is un-interned
+//     and its id is recycled (freeTopicIDs) for the next new topic.
 //   - topicPosts — per-topic ascending slice of live post ids.
 //   - userPosts — per-user ascending slice of that user's post ids; a
 //     user's posts are only tombstoned when the user is deleted, so
@@ -92,11 +96,16 @@ type Service struct {
 	timestamps    []int64
 	mentionFlat   []int32
 	mentionOff    []int64
+	liveMentions  int64
+	deadMentions  int64
 	topicIDs      map[string]int32
 	topicNames    []string
 	topicPosts    [][]int32
+	freeTopicIDs  []int32 // ids of retired topics, available for reuse
 	userPosts     map[string][]int32
-	compactions   int // times compactText has run (stats/tests only)
+
+	compactions        int // times compactText has run (tests only)
+	mentionCompactions int // times compactMentions has run (tests only)
 }
 
 var _ Yodelr = (*Service)(nil)
@@ -146,10 +155,19 @@ func (s *Service) compactText() {
 	oldChunks := s.textChunks
 	s.textChunks = nil
 	s.chunkPos = chunkSize
+	freed := 0 // oldChunks[:freed] have been released
 	for postID := range s.textLoc {
 		loc := s.textLoc[postID]
 		if loc == deadLoc {
 			continue
+		}
+		// Live locations are assigned in ascending order (both by
+		// AddPost and by this loop), so the old chunk index never
+		// decreases; chunks behind the read position are finished and
+		// can be released at once. That keeps the transient footprint
+		// at live bytes + one chunk instead of old blob + new blob.
+		for ci := int(loc >> chunkBits); freed < ci; freed++ {
+			oldChunks[freed] = nil
 		}
 		pos := loc & chunkMask
 		size := uint64(s.textLen[postID])
@@ -158,6 +176,40 @@ func (s *Service) compactText() {
 	}
 	s.deadTextBytes = 0
 	s.compactions++
+}
+
+// compactMentions rebuilds the mention log without tombstones,
+// rewriting every post's CSR offsets in place. O(total mentions);
+// triggered only when tombstones outnumber live mentions, so the cost
+// is amortized O(1) per deleted mention — and a trending scan touches
+// at most twice the live mentions in its window, however many posts
+// have ever been deleted.
+func (s *Service) compactMentions() {
+	flat := s.mentionFlat
+	off := s.mentionOff
+	var w, read int64
+	for p := 0; p+1 < len(off); p++ {
+		next := off[p+1]
+		off[p] = w
+		for r := read; r < next; r++ {
+			if flat[r] != deletedTopic {
+				flat[w] = flat[r]
+				w++
+			}
+		}
+		read = next
+	}
+	off[len(off)-1] = w
+	switch {
+	case w == 0:
+		s.mentionFlat = nil
+	case int64(cap(flat)) > 2*w:
+		s.mentionFlat = slices.Clone(flat[:w]) // actually return the slack
+	default:
+		s.mentionFlat = flat[:w]
+	}
+	s.deadMentions = 0
+	s.mentionCompactions++
 }
 
 // ----------------------------------------------------------------------
@@ -279,14 +331,22 @@ func (s *Service) AddPost(userName, postText string, timestamp int64) error {
 	for _, topic := range appendTopics(topicBuf[:0], postText) {
 		topicID, ok := s.topicIDs[topic]
 		if !ok {
-			topicID = int32(len(s.topicNames))
 			topic = strings.Clone(topic) // don't pin the whole post text
+			if n := len(s.freeTopicIDs); n > 0 {
+				// Reuse a retired topic's slot (see DeleteUser).
+				topicID = s.freeTopicIDs[n-1]
+				s.freeTopicIDs = s.freeTopicIDs[:n-1]
+				s.topicNames[topicID] = topic
+			} else {
+				topicID = int32(len(s.topicNames))
+				s.topicNames = append(s.topicNames, topic)
+				s.topicPosts = append(s.topicPosts, nil)
+			}
 			s.topicIDs[topic] = topicID
-			s.topicNames = append(s.topicNames, topic)
-			s.topicPosts = append(s.topicPosts, nil)
 		}
 		s.mentionFlat = append(s.mentionFlat, topicID)
 		s.topicPosts[topicID] = append(s.topicPosts[topicID], postID)
+		s.liveMentions++
 	}
 	s.mentionOff = append(s.mentionOff, int64(len(s.mentionFlat)))
 	s.userPosts[userName] = append(userPosts, postID)
@@ -299,11 +359,14 @@ func (s *Service) AddPost(userName, postText string, timestamp int64) error {
 //
 // The posts' text bytes are zeroed immediately (nothing readable
 // remains) and their blob space is reclaimed by compaction once it
-// exceeds half of the stored bytes. Each affected topic's index is
-// rebuilt once without the deleted ids. Cost is O(user's mentions +
-// size of affected topic indexes + amortized compaction); deletions are
-// the rare operation, so the price is paid here rather than on every
-// query.
+// exceeds half of the stored bytes; mention-log tombstones are likewise
+// compacted away once they outnumber live mentions. Each affected
+// topic's index is rebuilt once without the deleted ids and right-sized
+// when mostly slack; a topic left with no live posts is retired
+// entirely — its interned name is freed (honouring the privacy intent
+// of deletion) and its id recycled. Cost is O(user's mentions + size of
+// affected topic indexes + amortized compaction); deletions are the
+// rare operation, so the price is paid here rather than on every query.
 func (s *Service) DeleteUser(userName string) error {
 	userPosts, ok := s.userPosts[userName]
 	if !ok {
@@ -329,11 +392,33 @@ func (s *Service) DeleteUser(userName string) error {
 		for k := s.mentionOff[postID]; k < s.mentionOff[postID+1]; k++ {
 			affectedTopics[s.mentionFlat[k]] = struct{}{}
 			s.mentionFlat[k] = deletedTopic
+			s.liveMentions--
+			s.deadMentions++
 		}
 	}
 	for topicID := range affectedTopics {
-		s.topicPosts[topicID] = slices.DeleteFunc(s.topicPosts[topicID],
+		kept := slices.DeleteFunc(s.topicPosts[topicID],
 			func(p int32) bool { _, dead := deleted[p]; return dead })
+		switch {
+		case len(kept) == 0:
+			// Retire the topic. No live post mentions it, so no live
+			// mention-log entry holds its id: the next new topic can
+			// safely take the slot over, and un-interning the name
+			// frees it.
+			delete(s.topicIDs, s.topicNames[topicID])
+			s.topicNames[topicID] = ""
+			s.topicPosts[topicID] = nil
+			s.freeTopicIDs = append(s.freeTopicIDs, topicID)
+		case cap(kept) > 2*len(kept):
+			// DeleteFunc filters in place and would keep the whole old
+			// backing array alive; right-size once most of it is slack.
+			s.topicPosts[topicID] = slices.Clone(kept)
+		default:
+			s.topicPosts[topicID] = kept
+		}
+	}
+	if s.deadMentions > s.liveMentions {
+		s.compactMentions()
 	}
 	if s.deadTextBytes > s.liveTextBytes {
 		s.compactText()
@@ -389,12 +474,14 @@ func (s *Service) GetTrendingTopics(fromTimestamp, toTimestamp int64) []string {
 		return []string{}
 	}
 	// Posts lo..hi-1 occupy one contiguous span of the mention log;
-	// count it in one pass.
+	// count it in one pass. Deleted posts' tombstones are skipped with
+	// a branch (compactMentions keeps them a minority of the span).
 	counts := make(map[int32]int64)
 	for _, topicID := range s.mentionFlat[s.mentionOff[lo]:s.mentionOff[hi]] {
-		counts[topicID]++
+		if topicID != deletedTopic {
+			counts[topicID]++
+		}
 	}
-	delete(counts, deletedTopic)
 	type topicCount struct {
 		id    int32
 		count int64

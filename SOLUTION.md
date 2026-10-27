@@ -95,14 +95,21 @@ hashmap: `[]int32`/`[]int64` elements cost their raw 4/8 bytes.
   never touched.
 * **DeleteUser** — for each of the user's posts: zero its text bytes in
   place (nothing readable remains), mark its location dead, and
-  overwrite its mention-log entries with the sentinel `-1`; then
-  rebuild each *affected* topic's posting list once, filtering out the
-  deleted ids. Trending needs no liveness check at all: deleted
-  mentions count under key `-1`, removed with one map delete. When more
-  than half of all stored text bytes are dead, one compaction pass
-  rebuilds the text blob, so reclamation is amortized O(1) per delete.
-  Deletions are the rare operation; the price is paid here so reads
-  stay filter-free.
+  overwrite its mention-log entries with the sentinel `-1` (trending
+  skips these with one branch). Each *affected* topic's posting list is
+  rebuilt once without the deleted ids and right-sized when mostly
+  slack; a topic left with no live posts is retired outright — its
+  interned name is freed (completing the privacy intent of deletion)
+  and its id recycled for the next new topic, which is safe because an
+  empty posting list proves no live mention references the id. Both
+  shared logs self-compact: when dead text bytes exceed live ones, one
+  pass rebuilds the text blob (releasing old chunks progressively, so
+  the transient peak is live bytes + one chunk, not old + new), and
+  when tombstones outnumber live mentions, one pass rebuilds the
+  mention log — so reclamation is amortized O(1) per delete and a
+  trending scan touches at most twice the live mentions in its window,
+  however many posts have ever been deleted. Deletions are the rare
+  operation; the price is paid here so reads stay (nearly) filter-free.
 
 ### Differences from the Python original
 
@@ -138,6 +145,24 @@ these are the deliberate ports-of-idiom and fixes:
    is reported as an error (Python parsed it as a big int and let the
    service's range check reject it) rather than silently treated as
    post text.
+7. **Mention-log compaction.** The Python original scans deletion
+   tombstones in the queried window forever (its notes name amortized
+   compaction as the fix if deletions mattered); here the mention log
+   rebuilds itself once tombstones outnumber live mentions, bounding
+   every trending scan to at most 2× the live mentions in its window.
+8. **Topic retirement.** Python interns topic names forever (a
+   documented limit there, and a privacy wrinkle: the name of a
+   deleted user's hashtag outlived the deletion); here a topic whose
+   last live post dies is un-interned and its id recycled.
+9. **Posting lists are right-sized after deletion.** A straight port
+   (`slices.DeleteFunc`) would keep each rebuilt list's full old
+   backing array — Python rebuilt fresh arrays, so this Go-specific
+   trap is closed by cloning once a list is mostly slack.
+10. **Text compaction releases old chunks progressively** (live
+    locations ascend with post id, so finished chunks free as the pass
+    advances). Python holds the whole old blob until the pass ends,
+    briefly costing ~1.5× the blob at the exact moment memory is
+    already tight.
 
 ### Why not …
 
@@ -265,10 +290,9 @@ transiently allocates ~190 MiB instead of ~300 MiB.
 ## Known limits
 
 * Single-threaded by spec; no locking anywhere.
-* A deleted post permanently keeps its ~22 bytes of id/timestamp/offset
-  slots; its text bytes are zeroed immediately and reclaimed by
-  compaction once more than half the blob is dead.
-* Topic names are interned forever, even if every mentioning post is
-  deleted (not observable through the API; costs only the string).
+* A deleted post permanently keeps its ~26 bytes of
+  id/timestamp/offset slots; its text bytes are zeroed immediately, and
+  both the text blob and the mention log reclaim dead space by
+  amortized compaction once it outweighs the live data.
 * Beyond a few hundred million posts the right move is out of scope by
   the challenge rules anyway: sharding and/or a disk-backed index.
